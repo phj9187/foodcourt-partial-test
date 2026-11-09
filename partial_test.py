@@ -70,10 +70,15 @@ def sample_box(n, box, seed, prefix='box'):
     return out
 
 
-def load_config(source, config):
+def load_config(source, config, overrides=()):
     import yaml
     from kiosk_adaptive.study import DEFAULT
     cfg = dict(DEFAULT, **yaml.safe_load((Path(source)/config).read_text(encoding='utf-8')))
+    for item in overrides:
+        key, value = item.split('=', 1)
+        if key not in DEFAULT:
+            raise ValueError(f'unknown setting {key} for this source version')
+        cfg[key] = yaml.safe_load(value)
     cfg['audit_thresholds'] = dict(DEFAULT['audit_thresholds'], **(cfg['audit_thresholds'] or {}))
     return cfg
 
@@ -84,7 +89,8 @@ def build(cfg):
     settings = Settings(seed=cfg['seed'], recommendation_count=1, venue_types=tuple(cfg['venue_types']),
                         venue_lhs_candidates=cfg['venue_lhs_candidates'], taste_noise_override=cfg['taste_noise_override'],
                         input_noise=cfg['input_noise'], input_missing_probability=cfg['input_missing_probability'],
-                        stock_basis=cfg['stock_basis']).validate()
+                        stock_basis=cfg['stock_basis'],
+                        **({'input_minutes': cfg['input_minutes']} if 'input_minutes' in cfg else {})).validate()
     catalog = {s: [make_court(settings, i, s, cfg['visitors'], cfg[s+'_courts']) for i in range(cfg[s+'_courts'])]
                for s in ('train', 'validation', 'test')}
     return settings, catalog
@@ -114,9 +120,9 @@ def select_objectives(cfg, ids, customs):
 _STATE = {}
 
 
-def _init(source, config, output):
+def _init(source, config, output, overrides=()):
     sys.path.insert(0, str(Path(source)/'src'))
-    cfg = load_config(source, config)
+    cfg = load_config(source, config, overrides)
     settings, catalog = build(cfg)
     audit_path = Path(output)/'baseline_audit.json'
     audit = json.loads(audit_path.read_text(encoding='utf-8')) if audit_path.exists() else None
@@ -151,15 +157,20 @@ def read_summaries(folder, objective_id):
     return out
 
 
-def aggregate(objectives, output, reference, seed):
+def aggregate(objectives, output, reference, seed, sensitivity=False):
     from kiosk_adaptive.study import combine_replicas
     report, rows = {}, []
     for o in objectives:
         new = read_summaries(output, o.id)
         old = read_summaries(reference, o.id)
-        both = {**old, **new}
+        if sensitivity:
+            # Changed environment: never pool. Compare with the main run's same replicas (same seeds).
+            old = {r: v for r, v in old.items() if r in new}
+            both = {}
+        else:
+            both = {**old, **new}
         entry = dict(objective=asdict(o), reference_replicas=sorted(old), new_replicas=sorted(new))
-        for label, group in (('new_only', new), ('reference_only', old), ('pooled', both)):
+        for label, group in (('new_only', new), ('reference_same_reps' if sensitivity else 'reference_only', old), ('pooled', both)):
             if not group:
                 continue
             sums = [group[r] for r in sorted(group)]
@@ -185,6 +196,16 @@ def aggregate(objectives, output, reference, seed):
                                  profit_lo=(part[scenario]['profit_t95_won'] or [None])[0],
                                  profit_hi=(part[scenario]['profit_t95_won'] or [None, None])[1]))
             entry[label] = part
+        if sensitivity and old:
+            paired = {}
+            for scenario in ('stable', 'changed'):
+                reps_ = [r for r in sorted(new) if r in old and scenario in new[r]['results'] and scenario in old[r]['results']]
+                if reps_:
+                    d = lambda k, m=1.: [m*(new[r]['results'][scenario][k]-old[r]['results'][scenario][k]) for r in reps_]
+                    paired[scenario] = dict(replicas=reps_,
+                        customer_change_per100=d('mean_customer_delta', 100.), profit_change_won=d('mean_profit_delta_won'),
+                        F_change=d('mean_delta'))
+            entry['change_vs_reference'] = paired
         report[o.id] = entry
     return report, rows
 
@@ -202,12 +223,14 @@ def main(argv=None):
     ap.add_argument('--sample-seed', type=int, default=20261109)
     ap.add_argument('--reps', default='5-8', help='NEW replica indices, e.g. 5-8 or 5,6,7')
     ap.add_argument('--workers', type=int, default=multiprocessing.cpu_count())
+    ap.add_argument('--set', action='append', default=[], help='override a config value, e.g. input_minutes=0.5 (sensitivity run: compared with the reference, never pooled)')
     ap.add_argument('--dry-run', action='store_true', help='only print the chosen weightings')
     ap.add_argument('--aggregate-only', action='store_true')
     args = ap.parse_args(argv)
 
     sys.path.insert(0, str(Path(args.source)/'src'))
-    cfg = load_config(args.source, args.config)
+    cfg = load_config(args.source, args.config, args.set)
+    sensitivity = bool(args.set)
     ids = [x.strip() for x in args.objectives.split(',') if x.strip()]
     customs = [parse_custom(c) for c in args.custom]
     if args.sample:
@@ -216,6 +239,8 @@ def main(argv=None):
     if not objectives:
         raise SystemExit('choose --objectives and/or --custom')
     reps = parse_reps(args.reps)
+    if sensitivity:
+        print('sensitivity settings:', ', '.join(args.set), flush=True)
     print('objectives (a=taste, b=price, c=waiting, lambda=customer share, q=profit vs waste):', flush=True)
     for o in objectives:
         print(f'  {o.id}: a={o.taste:.3f} b={o.affordability:.3f} c={o.waiting:.3f} lambda={o.customer_share:.3f} q={o.profit_share:.3f}', flush=True)
@@ -225,13 +250,13 @@ def main(argv=None):
     reference = Path(args.reference) if args.reference else None
     if reference and not (reference/'manifest.json').exists():
         raise SystemExit(f'reference folder has no manifest.json: {reference}')
-    if reference:
+    if reference and not sensitivity:
         clash = [f'{o.id}/rep_{r}' for o in objectives for r in reps if (reference/o.id/f'rep_{r}'/'summary.json').exists()]
         if clash:
             raise SystemExit('these replicas already exist in the reference run (same seed, not independent): '+', '.join(clash))
 
     import torch, numpy
-    plan = dict(schema=1, source=str(args.source), config=args.config, config_values={k: v for k, v in cfg.items() if k != 'workers'},
+    plan = dict(schema=1, overrides=args.set, source=str(args.source), config=args.config, config_values={k: v for k, v in cfg.items() if k != 'workers'},
                 objectives=[asdict(o) for o in objectives], reps=reps, reference=str(reference) if reference else None,
                 versions=dict(torch=torch.__version__, numpy=numpy.__version__))
     plan_path = output/'partial_plan.json'
@@ -245,7 +270,7 @@ def main(argv=None):
         (output/'baseline_audit.json').write_bytes((reference/'baseline_audit.json').read_bytes())
 
     def write_report():
-        report, rows = aggregate(objectives, output, reference, cfg['seed'])
+        report, rows = aggregate(objectives, output, reference, cfg['seed'], sensitivity)
         (output/'partial_summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding='utf-8')
         import csv
         if rows:
@@ -260,7 +285,7 @@ def main(argv=None):
         from concurrent.futures import ProcessPoolExecutor, as_completed
         t0 = time.time()
         with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs)), mp_context=multiprocessing.get_context('spawn'),
-                                 initializer=_init, initargs=(str(args.source), args.config, str(output))) as pool:
+                                 initializer=_init, initargs=(str(args.source), args.config, str(output), tuple(args.set))) as pool:
             futures = {pool.submit(_job, asdict(o), r): (o.id, r) for o, r in jobs}
             for fut in as_completed(futures):
                 oid, r = futures[fut]
@@ -270,11 +295,16 @@ def main(argv=None):
                 write_report()
     report = write_report()
     for oid, e in report.items():
-        for label in ('new_only', 'pooled'):
+        for label in ('new_only', 'reference_same_reps', 'pooled'):
             s = e.get(label, {}).get('stable')
             if s:
                 print(f'{oid} [{label}, n={s["replicas"]}] customer {s["customer_delta_per100"]:+.3f}/100 '
                       f'profit {s["profit_delta_won"]:+.0f} won  F {s["F_delta"]:+.5f}', flush=True)
+        ch = e.get('change_vs_reference', {}).get('stable')
+        if ch:
+            m = lambda v: sum(v)/len(v)
+            print(f'{oid} [change vs main run, same seeds, reps {ch["replicas"]}] customer {m(ch["customer_change_per100"]):+.3f}/100 '
+                  f'profit {m(ch["profit_change_won"]):+.0f} won  F {m(ch["F_change"]):+.5f}', flush=True)
 
 
 if __name__ == '__main__':

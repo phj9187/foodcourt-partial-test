@@ -9,10 +9,7 @@ seed_for(config seed, objective id, replica), so new replica numbers give
 independent seeds while everything else (courts, worlds, menus) stays identical.
 """
 import argparse, json, math, multiprocessing, os, sys, time
-# Colab TPU runtimes ship torch_tpu; when it auto-loads, torch.manual_seed tries to seed the TPU and
-# parallel workers collide on /tmp/libtpu_lockfile. The simulation is CPU-only, so never load it.
-os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')
-os.environ.setdefault('PJRT_DEVICE', 'CPU')
+os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')  # best effort; see _cpu_only_seeding
 from dataclasses import replace, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,7 +121,17 @@ def select_objectives(cfg, ids, customs):
 _STATE = {}
 
 
+def _cpu_only_seeding():
+    # torch.manual_seed also seeds every registered custom device; on Colab TPU runtimes that is torch_tpu,
+    # which takes a machine-wide libtpu lock, so only one worker could start. The simulation never uses the
+    # device, and CPU seeding is unchanged, so skip the device part.
+    import torch.random
+    if hasattr(torch.random, '_seed_custom_device'):
+        torch.random._seed_custom_device = lambda seed: None
+
+
 def _init(source, config, output, overrides=()):
+    _cpu_only_seeding()
     sys.path.insert(0, str(Path(source)/'src'))
     cfg = load_config(source, config, overrides)
     settings, catalog = build(cfg)

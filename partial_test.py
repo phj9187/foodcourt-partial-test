@@ -8,7 +8,11 @@ Same job code as the main run (kiosk_adaptive.study.run_job): a job's seed is
 seed_for(config seed, objective id, replica), so new replica numbers give
 independent seeds while everything else (courts, worlds, menus) stays identical.
 """
-import argparse, json, math, multiprocessing, sys, time
+import argparse, json, math, multiprocessing, os, sys, time
+# Colab TPU runtimes ship torch_tpu; when it auto-loads, torch.manual_seed tries to seed the TPU and
+# parallel workers collide on /tmp/libtpu_lockfile. The simulation is CPU-only, so never load it.
+os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')
+os.environ.setdefault('PJRT_DEVICE', 'CPU')
 from dataclasses import replace, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -287,12 +291,20 @@ def main(argv=None):
         with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs)), mp_context=multiprocessing.get_context('spawn'),
                                  initializer=_init, initargs=(str(args.source), args.config, str(output), tuple(args.set))) as pool:
             futures = {pool.submit(_job, asdict(o), r): (o.id, r) for o, r in jobs}
+            failed = []
             for fut in as_completed(futures):
                 oid, r = futures[fut]
-                s = fut.result()['results']['stable']
+                try:
+                    s = fut.result()['results']['stable']
+                except Exception as exc:  # one bad job must not throw away the others; rerun resumes it
+                    failed.append(f'{oid} rep={r}')
+                    print(f'FAILED {oid} rep={r}: {exc!r}', flush=True)
+                    continue
                 print(f'DONE {oid} rep={r} F={s["mean_delta"]:+.5f} customer={100*s["mean_customer_delta"]:+.3f}/100 '
                       f'profit={s["mean_profit_delta_won"]:+.0f}won elapsed={(time.time()-t0)/60:.1f}min', flush=True)
                 write_report()
+        if failed:
+            print('FAILED jobs (rerun this cell to retry them): '+', '.join(failed), flush=True)
     report = write_report()
     for oid, e in report.items():
         for label in ('new_only', 'reference_same_reps', 'pooled'):
